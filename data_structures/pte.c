@@ -25,3 +25,9 @@ PPTE find_PTE_location(PULONG_PTR arbitrary_va, PULONG_PTR VA_space_start) {
     ULONG_PTR pte_index = ((ULONG_PTR) arbitrary_va - (ULONG_PTR) VA_space_start) / PAGE_SIZE;
     return page_table_start + pte_index;
 }
+
+
+PULONG_PTR findVAFromPTE(PPTE pte, PULONG_PTR VA_space_start) {
+    ULONG_PTR VAOffset = ((ULONG_PTR) (pte - page_table_start) * PAGE_SIZE);
+    return  (PULONG_PTR) (VAOffset + (ULONG_PTR) VA_space_start);
+}

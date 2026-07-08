@@ -42,3 +42,5 @@ void set_PTE_to_invalid(PPTE pte);
 void create_all_PTEs(ULONG_PTR number_of_PTEs);
 
 PPTE find_PTE_location(PULONG_PTR arbitrary_va, PULONG_PTR VA_space_start);
+
+PULONG_PTR findVAFromPTE(PPTE pte, PULONG_PTR VA_space_start);

@@ -1,6 +1,5 @@
 #pragma once
 
-#include "../macros.h"
 #include "pte.h"
 
 #define PFN_FREE 0
