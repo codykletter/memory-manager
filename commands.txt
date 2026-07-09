@@ -1,0 +1,135 @@
+/********************** TERMINAL **********************/
+Compile with all files
+cl -Zi -o memory_manager.exe cody_vm.c data_structures/*.c
+cmake ..
+
+Debug
+windbg memory_manager.exe
+
+Run
+memory_manager
+
+/*********************** TESTS ************************/
+Start recording
+xperf -on SysProf -stackwalk Profile
+
+<run test>
+
+Stop recording and dump to filename.etl
+xperf -d <filename>.etl
+xperf -d bitmaptrace.etl
+
+/*********************** DEBUG ************************/
+
+Ignore page fault exceptions
+sxd <exception>
+av is access violation
+Second chance is a real exception
+
+See list of threads
+~
+
+Switch to thread
+~<Thread>s
+
+Find handle
+!handle <process> <type> <flags>
+
+Dump memory
+dc <address>
+
+Dump memory (qword)
+dq <address>
+
+Dump local variables
+dv
+
+Dump a local variable
+dv <name>
+
+Dump global variable
+?? <name>
+
+dump struct at an address
+dt <type> <address>
+
+Set a breakpoint in a function
+bp <binary>!<function>
+binary is not equivalent to file
+
+Simplified once in a file
+bp <function>
+
+See list of breakpoints
+bl
+
+Disable breakpoint
+bd <breakpoint>
+
+Enable breakpoint
+be <breakpoint>
+
+Delete breakpoint
+bc <breakpoint>
+
+Set breakpoint on write
+ba w<bits (1-8)> <address>
+
+Set breakpoint on read
+ba r<bits (1-8)> <address>
+
+Run command after hitting breakpoint
+bp <address> "command;command"
+
+Go
+g
+
+Go immediately
+gh
+
+Math
+? <expression>
+
+Base Conversions
+? <0xHEX> or ? <0bBINARY> or ? <0nDECIMAL>
+
+See Call Stack
+kn
+
+See call stack on all threads
+~*k
+
+Unassemble
+u
+
+Search for variables
+x <binary>!<name>
+
+Change frame
+.frame <number
+
+Examine critical section
+!critsec <address>
+
+See Registers
+r
+
+Change instruction
+eb <address> <opcode> (90 for null)
+
+Set Register
+r <register>=<value>
+
+Register Calling Conventions
+https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170
+
+First 4 parameters to any given function in this order
+rcx rdx r8 r9
+Extras will be pushed into the stack
+
+In any given function call, rax will be the return value of the function
+Same with the others on return as the callee has free rights to do whatever it wants
+Other registers like rbx rsi rdi are all preserved
+
+Interlocked Increment
+https://docs.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-interlockedincrement

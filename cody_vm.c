@@ -3,6 +3,7 @@
 #include <windows.h>
 #include "macros.h"
 #include "data_structures/pfn.h"
+#include "data_structures/pagefile.h"
 
 //
 // This define enables code that lets us create multiple virtual address
@@ -178,6 +179,8 @@ st_state_machine_test (
     ULONG_PTR highest_page_number;
     PPFN pfn_array;
 
+    create_paging_file ();
+
     //
     // Allocate the physical pages that we will be managing.
     //
@@ -325,6 +328,19 @@ st_state_machine_test (
 
         return;
     }
+
+    PULONG_PTR scratch_va_start = VirtualAlloc (NULL,
+                      PAGE_SIZE,
+                      MEM_RESERVE | MEM_PHYSICAL,
+                      PAGE_READWRITE);
+
+    if (scratch_va_start == NULL) {
+
+        printf ("full_virtual_memory_test : could not reserve scratch memory %x\n",
+                GetLastError ());
+
+        return;
+    }
     //
     // Now perform random accesses.
     //
@@ -378,63 +394,83 @@ st_state_machine_test (
 
         if (page_faulted) {
 
-            //
-            // Connect the virtual address now - if that succeeds then
-            // we'll be able to access it from now on.
-            //
-            // THIS IS JUST REUSING THE SAME PHYSICAL PAGE OVER AND OVER !
-            //
-            // IT NEEDS TO BE REPLACED WITH A TRUE MEMORY MANAGEMENT
-            // STATE MACHINE !
-            
-            // Wire our final page table
             PPTE PTE_location = find_PTE_location(arbitrary_va, VA_space_start);
-            // If we have zero pages available in our list
+            PPFN page_pfn;
+            ULONG_PTR frame_number;
+
             if (!IsListEmpty(&zero_list_head)) {
-                // Go to the zero list to get a zero page
-                PPFN page_pfn = (PPFN) RemoveHeadList(&zero_list_head);
-                // Calculate page number of that page
-                ULONG_PTR frame_number = calculate_page_number(page_pfn, pfn_array);
-                // Add zero page to our active page list
-                InsertHeadList(&active_list_head, &page_pfn->entry);
-                page_pfn->state = PFN_ACTIVE;
-                // Set our frame number in our PTE
-                set_PTE_to_valid(PTE_location, frame_number);
-                page_pfn->pte = PTE_location;
-            }
-            else {
-                // If all pages are active
-                printf("all pages in use!\n");
-                
-                DebugBreak();
+
+                page_pfn = (PPFN) RemoveHeadList(&zero_list_head);
+                frame_number = calculate_page_number(page_pfn, pfn_array);
+
+            } else {
+
+                page_pfn = (PPFN) RemoveHeadList(&active_list_head);
+
+                PPTE old_PTE_location = page_pfn->pte;
+                frame_number = old_PTE_location->ram_pte.frame_number;
+
+                PULONG_PTR old_va = find_VA_from_PTE(old_PTE_location, VA_space_start);
+
+                if (MapUserPhysicalPages(old_va, 1, NULL) == FALSE) {
+                    DebugBreak();
+                }
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
+                    DebugBreak();
+                }
+
+                int disk_slot_index = find_free_disk_slot();
+
+                if (disk_slot_index == -1) {
+                    DebugBreak();
+                }
+
+                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
+
+                memcpy(disk_address, scratch_va_start, PAGE_SIZE);
+
+                set_PTE_to_disk(old_PTE_location, disk_slot_index);
+
+                memset(scratch_va_start, 0, PAGE_SIZE);
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
+                    DebugBreak();
+                }
             }
 
-            if (MapUserPhysicalPages (arbitrary_va, 1, physical_page_numbers) == FALSE) {
+            page_pfn->state = PFN_ACTIVE;
+            InsertTailList(&active_list_head, &page_pfn->entry);
 
-                printf ("full_virtual_memory_test : could not map VA %p to page %llX\n", arbitrary_va, *physical_page_numbers);
+            if (PTE_location->disk_pte.status == PTE_ON_DISK) {
+
+                ULONG_PTR disk_slot_index = PTE_location->disk_pte.disk_slot;
+                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
+                    DebugBreak();
+                }
+
+                memcpy(scratch_va_start, disk_address, PAGE_SIZE);
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
+                    DebugBreak();
+                }
+
+                disk_slot_in_use[disk_slot_index] = FALSE;
+            }
+
+            set_PTE_to_valid(PTE_location, frame_number);
+            page_pfn->pte = PTE_location;
+
+            if (MapUserPhysicalPages (arbitrary_va, 1, &frame_number) == FALSE) {
+
+                printf ("full_virtual_memory_test : could not map VA %p to page %llX\n", arbitrary_va, frame_number);
 
                 return;
             }
-
-            //
-            // No exception handler needed now since we have connected
-            // the virtual address above to one of our physical pages
-            // so no subsequent fault can occur.
-            //
 
             *arbitrary_va = (ULONG_PTR) arbitrary_va;
-
-            //
-            // Unmap the virtual address translation we installed above
-            // now that we're done writing our value into it.
-            //
-
-            if (MapUserPhysicalPages (arbitrary_va, 1, NULL) == FALSE) {
-
-                printf ("full_virtual_memory_test : could not unmap VA %p\n", arbitrary_va);
-
-                return;
-            }
         }
     }
 
