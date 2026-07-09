@@ -14,7 +14,7 @@
 //
 
 #define SUPPORT_MULTIPLE_VA_TO_SAME_PAGE 0
-
+#define NUMBER_OF_THREADS       100000
 #pragma comment(lib, "advapi32.lib")
 
 #if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
@@ -38,6 +38,9 @@
 
 #define NUMBER_OF_PHYSICAL_PAGES   ((VIRTUAL_ADDRESS_SIZE / PAGE_SIZE) / 64)
 #define NUMBER_OF_PTES                              (VIRTUAL_ADDRESS_SIZE / PAGE_SIZE)
+// Globals
+CRITICAL_SECTION zero_list_lock;
+
 
 BOOL
 GetPrivilege  (
@@ -157,6 +160,147 @@ CreateSharedMemorySection (
 }
 
 #endif
+
+VOID access_all_VAs() {
+    for (i = 0; i < MB (1); i += 1) {
+
+        //
+        // Randomly access different portions of the virtual address
+        // space we obtained above.
+        //
+        // If we have never accessed the surrounding page size (4K)
+        // portion, the operating system will receive a page fault
+        // from the CPU and proceed to obtain a physical page and
+        // install a PTE to map it - thus connecting the end-to-end
+        // virtual address translation.  Then the operating system
+        // will tell the CPU to repeat the instruction that accessed
+        // the virtual address and this time, the CPU will see the
+        // valid PTE and proceed to obtain the physical contents
+        // (without faulting to the operating system again).
+        //
+
+        random_number = rand () * rand () * rand ();
+
+        random_number %= virtual_address_size_in_unsigned_chunks;
+
+        //
+        // Write the virtual address into each page.  If we need to
+        // debug anything, we'll be able to see these in the pages.
+        //
+
+        page_faulted = FALSE;
+
+        //
+        // Ensure the write to the arbitrary virtual address doesn't
+        // straddle a PAGE_SIZE boundary just to keep things simple for
+        // now.
+        //
+
+        random_number &= ~0x7;
+
+        arbitrary_va = VA_space_start + random_number;
+        // No need to lock here since we're re-writing the same VA
+        __try {
+            *arbitrary_va = (ULONG_PTR) arbitrary_va;
+
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+
+            page_faulted = TRUE;
+        }
+
+        if (page_faulted) {
+
+            PPTE old_PTE_location = find_PTE_location(arbitrary_va, VA_space_start);
+            PPFN page_pfn;
+            ULONG_PTR frame_number;
+
+            PULONG_PTR old_va = find_VA_from_PTE(old_PTE_location, VA_space_start);
+
+            // Lock the zero list so other threads can't access
+            EnterCriticalSection(&zero_list_lock);
+            // Read the old PTE and see if any other thread has been here
+            if (old_PTE_location->ram_pte.valid == 1) {
+                // No work necessary, VA is already wired up
+                // Simply leave critical section
+                LeaveCriticalSection(&zero_list_lock);
+                continue;
+            }
+            if (!IsListEmpty(&zero_list_head)) {
+
+                page_pfn = (PPFN) RemoveHeadList(&zero_list_head);
+                frame_number = calculate_page_number(page_pfn, pfn_array);
+            }
+            else {
+
+                page_pfn = (PPFN) RemoveHeadList(&active_list_head);
+
+                frame_number = old_PTE_location->ram_pte.frame_number;
+
+
+                if (MapUserPhysicalPages(old_va, 1, NULL) == FALSE) {
+                    DebugBreak();
+                }
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
+                    DebugBreak();
+                }
+
+                int disk_slot_index = find_free_disk_slot();
+
+                if (disk_slot_index == -1) {
+                    DebugBreak();
+                }
+
+                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
+
+                memcpy(disk_address, scratch_va_start, PAGE_SIZE);
+
+                set_PTE_to_disk(old_PTE_location, disk_slot_index);
+
+                memset(scratch_va_start, 0, PAGE_SIZE);
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
+                    DebugBreak();
+                }
+            }
+            // TODO: MAKE BETTER TOMORROW! (better everyday baby)
+            LeaveCriticalSection(&zero_list_lock);
+
+            page_pfn->state = PFN_ACTIVE;
+            InsertTailList(&active_list_head, &page_pfn->entry);
+
+            if (PTE_location->disk_pte.status == PTE_ON_DISK) {
+
+                ULONG_PTR disk_slot_index = PTE_location->disk_pte.disk_slot;
+                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
+                    DebugBreak();
+                }
+
+                memcpy(scratch_va_start, disk_address, PAGE_SIZE);
+
+                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
+                    DebugBreak();
+                }
+
+                disk_slot_in_use[disk_slot_index] = FALSE;
+            }
+
+            set_PTE_to_valid(PTE_location, frame_number);
+            page_pfn->pte = PTE_location;
+
+            if (MapUserPhysicalPages (arbitrary_va, 1, &frame_number) == FALSE) {
+
+                printf ("full_virtual_memory_test : could not map VA %p to page %llX\n", arbitrary_va, frame_number);
+
+                return;
+            }
+
+            *arbitrary_va = (ULONG_PTR) arbitrary_va;
+        }
+    }
+}
 VOID
 st_state_machine_test (
     VOID
@@ -178,6 +322,7 @@ st_state_machine_test (
     BOOL pages_full;
     ULONG_PTR highest_page_number;
     PPFN pfn_array;
+    InitializeCriticalSection(&zero_list_lock);
 
     create_paging_file ();
 
@@ -344,134 +489,14 @@ st_state_machine_test (
     //
     // Now perform random accesses.
     //
-
-    for (i = 0; i < MB (1); i += 1) {
-
-        //
-        // Randomly access different portions of the virtual address
-        // space we obtained above.
-        //
-        // If we have never accessed the surrounding page size (4K)
-        // portion, the operating system will receive a page fault
-        // from the CPU and proceed to obtain a physical page and
-        // install a PTE to map it - thus connecting the end-to-end
-        // virtual address translation.  Then the operating system
-        // will tell the CPU to repeat the instruction that accessed
-        // the virtual address and this time, the CPU will see the
-        // valid PTE and proceed to obtain the physical contents
-        // (without faulting to the operating system again).
-        //
-
-        random_number = rand () * rand () * rand ();
-
-        random_number %= virtual_address_size_in_unsigned_chunks;
-
-        //
-        // Write the virtual address into each page.  If we need to
-        // debug anything, we'll be able to see these in the pages.
-        //
-
-        page_faulted = FALSE;
-
-        //
-        // Ensure the write to the arbitrary virtual address doesn't
-        // straddle a PAGE_SIZE boundary just to keep things simple for
-        // now.
-        //
-
-        random_number &= ~0x7;
-
-        arbitrary_va = VA_space_start + random_number;
-
-        __try {
-
-            *arbitrary_va = (ULONG_PTR) arbitrary_va;
-
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-
-            page_faulted = TRUE;
-        }
-
-        if (page_faulted) {
-
-            PPTE PTE_location = find_PTE_location(arbitrary_va, VA_space_start);
-            PPFN page_pfn;
-            ULONG_PTR frame_number;
-
-            if (!IsListEmpty(&zero_list_head)) {
-
-                page_pfn = (PPFN) RemoveHeadList(&zero_list_head);
-                frame_number = calculate_page_number(page_pfn, pfn_array);
-
-            } else {
-
-                page_pfn = (PPFN) RemoveHeadList(&active_list_head);
-
-                PPTE old_PTE_location = page_pfn->pte;
-                frame_number = old_PTE_location->ram_pte.frame_number;
-
-                PULONG_PTR old_va = find_VA_from_PTE(old_PTE_location, VA_space_start);
-
-                if (MapUserPhysicalPages(old_va, 1, NULL) == FALSE) {
-                    DebugBreak();
-                }
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
-                    DebugBreak();
-                }
-
-                int disk_slot_index = find_free_disk_slot();
-
-                if (disk_slot_index == -1) {
-                    DebugBreak();
-                }
-
-                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
-
-                memcpy(disk_address, scratch_va_start, PAGE_SIZE);
-
-                set_PTE_to_disk(old_PTE_location, disk_slot_index);
-
-                memset(scratch_va_start, 0, PAGE_SIZE);
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
-                    DebugBreak();
-                }
-            }
-
-            page_pfn->state = PFN_ACTIVE;
-            InsertTailList(&active_list_head, &page_pfn->entry);
-
-            if (PTE_location->disk_pte.status == PTE_ON_DISK) {
-
-                ULONG_PTR disk_slot_index = PTE_location->disk_pte.disk_slot;
-                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
-                    DebugBreak();
-                }
-
-                memcpy(scratch_va_start, disk_address, PAGE_SIZE);
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
-                    DebugBreak();
-                }
-
-                disk_slot_in_use[disk_slot_index] = FALSE;
-            }
-
-            set_PTE_to_valid(PTE_location, frame_number);
-            page_pfn->pte = PTE_location;
-
-            if (MapUserPhysicalPages (arbitrary_va, 1, &frame_number) == FALSE) {
-
-                printf ("full_virtual_memory_test : could not map VA %p to page %llX\n", arbitrary_va, frame_number);
-
-                return;
-            }
-
-            *arbitrary_va = (ULONG_PTR) arbitrary_va;
-        }
+    HANDLE faulting_thread_handles[NUMBER_OF_THREADS];
+    for (i = 0; i < NUMBER_OF_THREADS; i += 1) {
+        // Create thread, pass in access all virtual addresses
+        faulting_thread_handles[i] = CreateThread(NULL, 0, access_all_VAs, NULL, 0, NULL);
+    }
+    for (i = 0; i < NUMBER_OF_THREADS; i += 1) {
+        // Wait for all threads to die
+        WaitForSingleObject(faulting_thread_handles[i], 0);
     }
 
     printf ("full_virtual_memory_test : finished accessing %u random virtual addresses\n", i);

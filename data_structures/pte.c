@@ -1,9 +1,12 @@
 #include "pte.h"
 
 #define BYTES_OF_PTE 8
+// Globals
+CRITICAL_SECTION pte_lock;
 
 extern PPTE page_table_start;
 void create_all_PTEs(ULONG_PTR number_of_PTEs) {
+    InitializeCriticalSection(&pte_lock);
     page_table_start = malloc(BYTES_OF_PTE * number_of_PTEs);
     if (page_table_start == NULL) {
         printf("couldn't reserve memory");
@@ -12,6 +15,12 @@ void create_all_PTEs(ULONG_PTR number_of_PTEs) {
     memset(page_table_start, 0, BYTES_OF_PTE * number_of_PTEs);
 }
 
+void acquire_PTE_lock() {
+    EnterCriticalSection(&pte_lock);
+}
+void release_PTE_lock() {
+    LeaveCriticalSection(&pte_lock);
+}
 void set_PTE_to_valid(PPTE pte, ULONG_PTR frame_number) {
     pte->ram_pte.frame_number = frame_number;
     pte->ram_pte.valid = PTE_VALID;

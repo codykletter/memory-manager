@@ -44,3 +44,5 @@ void set_PTE_to_disk(PPTE pte, ULONG_PTR disk_slot);
 void create_all_PTEs(ULONG_PTR number_of_PTEs);
 PPTE find_PTE_location(PULONG_PTR arbitrary_va, PULONG_PTR VA_space_start);
 PULONG_PTR find_VA_from_PTE(PPTE pte, PULONG_PTR VA_space_start);
+void acquire_PTE_lock();
+void release_PTE_lock();
