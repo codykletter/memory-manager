@@ -15,4 +15,6 @@ add_executable(memory_manager
         data_structures/pagefile.h
         cody_vm.c
         macros.h
+        pages.h
+        pages.c
 )

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include "macros.h"
 #include "data_structures/pfn.h"
+#include "pages.h"
 #include "data_structures/pagefile.h"
 
 //
@@ -14,7 +15,7 @@
 //
 
 #define SUPPORT_MULTIPLE_VA_TO_SAME_PAGE 0
-#define NUMBER_OF_THREADS       100000
+#define NUMBER_OF_THREADS       5
 #pragma comment(lib, "advapi32.lib")
 
 #if SUPPORT_MULTIPLE_VA_TO_SAME_PAGE
@@ -31,6 +32,8 @@
 
 #define VIRTUAL_ADDRESS_SIZE_IN_UNSIGNED_CHUNKS        (VIRTUAL_ADDRESS_SIZE / sizeof (ULONG_PTR))
 
+
+
 //
 // Deliberately use a physical page pool that is approximately 1% of the
 // virtual address space !
@@ -38,14 +41,43 @@
 
 #define NUMBER_OF_PHYSICAL_PAGES   ((VIRTUAL_ADDRESS_SIZE / PAGE_SIZE) / 64)
 #define NUMBER_OF_PTES                              (VIRTUAL_ADDRESS_SIZE / PAGE_SIZE)
-// Globals
-CRITICAL_SECTION zero_list_lock;
 
+ULONG_PTR virtual_address_size_in_unsigned_chunks;
+unsigned i;
+// TODO AI: create list head structs with a list entry and a lock and count to re-organize. Update list functions to update the counts
+VOID initialize_globals(VOID) {
+    // Initialize list heads
+    InitializeListHead(&active_list_head);
+    InitializeListHead(&zero_list_head);
+    InitializeListHead(&free_list_head);
+    InitializeListHead(&modified_list_head);
+    InitializeListHead(&standby_list_head);
+
+    // Initialize locks
+    InitializeCriticalSection(&active_list_lock);
+    InitializeCriticalSection(&zero_list_lock);
+    InitializeCriticalSection(&free_list_lock);
+    InitializeCriticalSection(&modified_list_lock);
+    InitializeCriticalSection(&standby_list_lock);
+    InitializeCriticalSection(&disk_lock);
+
+    create_all_PTEs(NUMBER_OF_PTES);
+
+    // Virtual memory for the kernel
+    scratch_va_start = VirtualAlloc (NULL,
+                      PAGE_SIZE,
+                      MEM_RESERVE | MEM_PHYSICAL,
+                      PAGE_READWRITE);
+
+    if (scratch_va_start == NULL) {
+        printf ("full_virtual_memory_test : could not reserve scratch memory %x\n",
+                GetLastError ());
+        DebugBreak();
+    }
+}
 
 BOOL
-GetPrivilege  (
-    VOID
-    )
+GetPrivilege  (VOID)
 {
     struct {
         DWORD Count;
@@ -161,7 +193,13 @@ CreateSharedMemorySection (
 
 #endif
 
-VOID access_all_VAs() {
+VOID access_all_VAs(LPVOID lpParameter) {
+    PULONG_PTR arbitrary_va;
+    unsigned random_number;
+    BOOL page_faulted;
+    BOOL pages_full;
+    BOOL redo_fault = FALSE;
+
     for (i = 0; i < MB (1); i += 1) {
 
         //
@@ -181,7 +219,7 @@ VOID access_all_VAs() {
 
         random_number = rand () * rand () * rand ();
 
-        random_number %= virtual_address_size_in_unsigned_chunks;
+        random_number %= VIRTUAL_ADDRESS_SIZE_IN_UNSIGNED_CHUNKS;
 
         //
         // Write the virtual address into each page.  If we need to
@@ -198,106 +236,144 @@ VOID access_all_VAs() {
 
         random_number &= ~0x7;
 
-        arbitrary_va = VA_space_start + random_number;
-        // No need to lock here since we're re-writing the same VA
+        if (redo_fault == FALSE) {
+            arbitrary_va = VA_space_start + random_number;
+        }
+        // TODO: Add locks on this
         __try {
             *arbitrary_va = (ULONG_PTR) arbitrary_va;
-
+            // Make sure we're removing most recently accessed, not most recently added
+            // Move page to front of active list since we've recently accessed it
+            PPTE PTE_location = find_PTE_location(arbitrary_va, VA_space_start);
+            // Get frame number from PTE
+            ULONG_PTR frame_number = PTE_location->ram_pte.frame_number;
+            // Get PFN from frame number using sparse array and pointer arithmetic
+            PPFN page_pfn = pfn_array + frame_number;
+            // Get pointer to list entry of PFN
+            PLIST_ENTRY data_entry = (PLIST_ENTRY) page_pfn;
+            // Finally, bring page to start of active list
+            RemoveEntryList(data_entry);
+            InsertTailList(&active_list_head, data_entry);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
 
             page_faulted = TRUE;
         }
 
         if (page_faulted) {
-
-            PPTE old_PTE_location = find_PTE_location(arbitrary_va, VA_space_start);
+            // Get PTE of our faulting VA
+            PPTE PTE_location = find_PTE_location(arbitrary_va, VA_space_start);
             PPFN page_pfn;
             ULONG_PTR frame_number;
-
-            PULONG_PTR old_va = find_VA_from_PTE(old_PTE_location, VA_space_start);
-
-            // Lock the zero list so other threads can't access
-            EnterCriticalSection(&zero_list_lock);
-            // Read the old PTE and see if any other thread has been here
-            if (old_PTE_location->ram_pte.valid == 1) {
-                // No work necessary, VA is already wired up
-                // Simply leave critical section
-                LeaveCriticalSection(&zero_list_lock);
+            // Get PTE lock
+            acquire_PTE_lock();
+            // If another thread has already wired up the page, can exit early (work already done)
+            if (PTE_location->ram_pte.valid == PTE_VALID) {
+                release_PTE_lock();
+                redo_fault = TRUE;
                 continue;
             }
-            if (!IsListEmpty(&zero_list_head)) {
-
-                page_pfn = (PPFN) RemoveHeadList(&zero_list_head);
-                frame_number = calculate_page_number(page_pfn, pfn_array);
+            // If it's in transition, then soft fault (page if modified or standby)
+            if (PTE_location->transition_pte.transition == PTE_IN_TRANSITION) {
+                // Lock PFN to see which list lock to grab
+                EnterCriticalSection(&page_pfn->pfn_lock);
+                // TODO: can solidify modified and standby fault into one function
+                // Check whether page is on standby or modified list
+                if (page_pfn->state == PFN_MODIFIED) {
+                    // Soft fault and bring back page from modified list
+                    soft_fault_modified(page_pfn);
+                }
+                // MUST BE ON STANDBY IF NOT ON
+                else if (page_pfn->state == PFN_STANDBY){
+                    soft_fault_standby(page_pfn);
+                }
+                // Something's wrong, must be modified or standby
+                else {
+                    DebugBreak();
+                }
+                LeaveCriticalSection(&page_pfn->pfn_lock);
             }
+            // If it's not in transition, then it's either on disk or a first-time fault
+            // Regardless, we need to get a page to associate with the PTE (pulling from free list if free pages available, otherwise standby)
+            // If accessing old disk data
+            if (PTE_location->disk_pte.transition == PTE_ON_DISK) {
+                // TODO: something about free list lock
+                // Prioritize getting a free page first if we have any
+                // First make sure free list has pages before entering critical (expensive)
+                // Right now don't do speculative looking
+                // if (!IsListEmpty(&free_list_head)) {
+                    EnterCriticalSection(&free_list_lock);
+                    if (!IsListEmpty(&free_list_head)) {
+                        page_pfn = (PPFN) RemoveHeadList(&free_list_head);
+                        // Acquire page lock
+                        acquire_pfn_lock(page_pfn);
+                        frame_number = calculate_page_number(page_pfn, pfn_array);
+                    }
+                    // TODO AI: replace all zero lists with a free list pop and then zeroing if necsesary (not pulling from disk)
+                    LeaveCriticalSection(&free_list_lock);
+                    // TODO: FIX THIS
+                // }
+                // TODO: something about zero list lock
+                // // Lock the zero list so other threads can't access
+                // EnterCriticalSection(&zero_list_lock);
+                // // Read the PTE and see if any other thread has been here
+                // if (PTE_location->ram_pte.valid == 1) {
+                //     // No work necessary, VA is already wired up
+                //     LeaveCriticalSection(&zero_list_lock);
+                //     continue;
+                // }
+                // Worst case, trim active page to free (no need to zero since we will re-write)
+                else {
+                    page_pfn = (PPFN) RemoveHeadList(&active_list_head);
+                    frame_number = calculate_page_number(page_pfn, pfn_array);
+                    trim_active_to_free(page_pfn, frame_number);
+                }
+                // Finally, retrieve old data from disk
+                retrieve_page_from_disk(PTE_location, frame_number);
+            }
+            // If PTE has a frame number and not on disk, must be either on modified or standby (check for hits)
+            else if (PTE_location->ram_pte.frame_number != 0) {
+                frame_number = PTE_location->ram_pte.frame_number;
+                // Get PFN and look at state metadata to determine if page is on modified or standby
+                page_pfn = pfn_array + frame_number;
+                if (page_pfn->state == PFN_STANDBY) {
+                    soft_fault_standby(page_pfn);
+                } // Else if check might not be necessary but good just in case
+                else if (page_pfn->state == PFN_MODIFIED) {
+                    soft_fault_modified(page_pfn);
+                }
+            }
+            // New data, so we need a fully zeroed page!
             else {
-
-                page_pfn = (PPFN) RemoveHeadList(&active_list_head);
-
-                frame_number = old_PTE_location->ram_pte.frame_number;
-
-
-                if (MapUserPhysicalPages(old_va, 1, NULL) == FALSE) {
-                    DebugBreak();
+                // TODO: lock stuff
+                // If we have pages in our zero list, pop and retrieve
+                if (!IsListEmpty(&zero_list_head)) {
+                    page_pfn = (PPFN) RemoveHeadList(&zero_list_head);
+                    frame_number = calculate_page_number(page_pfn, pfn_array);
+                    // Release lock once zero page is accessed
+                    // LeaveCriticalSection(&zero_list_lock);
                 }
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
-                    DebugBreak();
-                }
-
-                int disk_slot_index = find_free_disk_slot();
-
-                if (disk_slot_index == -1) {
-                    DebugBreak();
-                }
-
-                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
-
-                memcpy(disk_address, scratch_va_start, PAGE_SIZE);
-
-                set_PTE_to_disk(old_PTE_location, disk_slot_index);
-
-                memset(scratch_va_start, 0, PAGE_SIZE);
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
-                    DebugBreak();
+                // Otherwise, get oldest accessed page from our active list, write it to disk, and trim to zero
+                else {
+                    page_pfn = (PPFN) RemoveHeadList(&active_list_head);
+                    frame_number = calculate_page_number(page_pfn, pfn_array);
+                    trim_active_to_zero(page_pfn, frame_number);
                 }
             }
-            // TODO: MAKE BETTER TOMORROW! (better everyday baby)
-            LeaveCriticalSection(&zero_list_lock);
-
             page_pfn->state = PFN_ACTIVE;
             InsertTailList(&active_list_head, &page_pfn->entry);
-
-            if (PTE_location->disk_pte.status == PTE_ON_DISK) {
-
-                ULONG_PTR disk_slot_index = PTE_location->disk_pte.disk_slot;
-                PVOID disk_address = (PVOID) ((ULONG_PTR) disk_base + disk_slot_index * PAGE_SIZE);
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, &frame_number) == FALSE) {
-                    DebugBreak();
-                }
-
-                memcpy(scratch_va_start, disk_address, PAGE_SIZE);
-
-                if (MapUserPhysicalPages(scratch_va_start, 1, NULL) == FALSE) {
-                    DebugBreak();
-                }
-
-                disk_slot_in_use[disk_slot_index] = FALSE;
-            }
-
+            // Wire up our new page and set it to valid
             set_PTE_to_valid(PTE_location, frame_number);
             page_pfn->pte = PTE_location;
 
             if (MapUserPhysicalPages (arbitrary_va, 1, &frame_number) == FALSE) {
-
                 printf ("full_virtual_memory_test : could not map VA %p to page %llX\n", arbitrary_va, frame_number);
-
-                return;
+                DebugBreak();
             }
-
-            *arbitrary_va = (ULONG_PTR) arbitrary_va;
+            // Update redo fault flag so we write VA on next pass
+            redo_fault = TRUE;
+        }
+        else {
+            redo_fault = FALSE;
         }
     }
 }
@@ -306,23 +382,15 @@ st_state_machine_test (
     VOID
     )
 {
-    unsigned i;
-    PULONG_PTR VA_space_start;
-    PULONG_PTR arbitrary_va;
-    unsigned random_number;
+    ULONG_PTR highest_page_number;
     BOOL allocated;
-    BOOL page_faulted;
     BOOL privilege;
-    BOOL obtained_pages;
     ULONG_PTR physical_page_count;
     PULONG_PTR physical_page_numbers;
     HANDLE physical_page_handle;
     ULONG_PTR virtual_address_size;
-    ULONG_PTR virtual_address_size_in_unsigned_chunks;
-    BOOL pages_full;
-    ULONG_PTR highest_page_number;
-    PPFN pfn_array;
-    InitializeCriticalSection(&zero_list_lock);
+    // Initialize all globals
+    initialize_globals();
 
     create_paging_file ();
 
@@ -393,12 +461,6 @@ st_state_machine_test (
         highest_page_number * sizeof(PFN),
         MEM_RESERVE,
         PAGE_READWRITE);
-    // Create list head for active list
-    LIST_ENTRY active_list_head;
-    InitializeListHead(&active_list_head);
-    LIST_ENTRY zero_list_head;
-    // Create list head for zero list
-    InitializeListHead(&zero_list_head);
     // Populate PFN with physical pages
     for (i = 0; i < physical_page_count; i++) {
         LPVOID result = VirtualAlloc((LPVOID)(pfn_array + physical_page_numbers[i]),
@@ -412,10 +474,6 @@ st_state_machine_test (
         // Add physical pages to zero list
         InsertTailList(&zero_list_head, &(pfn_array[physical_page_numbers[i]].entry));
     }
-
-    create_all_PTEs(NUMBER_OF_PTES);
-
-
 
     //
     // Reserve a user address space region using the Windows kernel
@@ -474,30 +532,45 @@ st_state_machine_test (
         return;
     }
 
-    PULONG_PTR scratch_va_start = VirtualAlloc (NULL,
-                      PAGE_SIZE,
-                      MEM_RESERVE | MEM_PHYSICAL,
-                      PAGE_READWRITE);
-
-    if (scratch_va_start == NULL) {
-
-        printf ("full_virtual_memory_test : could not reserve scratch memory %x\n",
-                GetLastError ());
-
-        return;
-    }
+    // Create events
+    initiate_trimming_event = CreateEvent(NULL, MANUAL_RESET, FALSE, NULL);
+    system_exit_event = CreateEvent(NULL, MANUAL_RESET, FALSE, NULL);
     //
     // Now perform random accesses.
     //
     HANDLE faulting_thread_handles[NUMBER_OF_THREADS];
     for (i = 0; i < NUMBER_OF_THREADS; i += 1) {
         // Create thread, pass in access all virtual addresses
-        faulting_thread_handles[i] = CreateThread(NULL, 0, access_all_VAs, NULL, 0, NULL);
+        faulting_thread_handles[i] = CreateThread(NULL,
+                                        0,
+                                        (LPTHREAD_START_ROUTINE)access_all_VAs,
+                                        NULL,
+                                        0,
+                                        NULL);
     }
+    // Create trimming thread
+    CreateThread(NULL,
+                                        0,
+                                        (LPTHREAD_START_ROUTINE) trim_pages_thread,
+                                        NULL,
+                                        0,
+                                        NULL);
+    // Create writing thread
+    CreateThread(NULL,
+                                        0,
+                                        (LPTHREAD_START_ROUTINE) write_pages_thread,
+                                        NULL,
+                                        0,
+                                        NULL);
+
+
+
     for (i = 0; i < NUMBER_OF_THREADS; i += 1) {
         // Wait for all threads to die
-        WaitForSingleObject(faulting_thread_handles[i], 0);
+        WaitForSingleObject(faulting_thread_handles[i], INFINITE);
     }
+
+    SetEvent(system_exit_event);
 
     printf ("full_virtual_memory_test : finished accessing %u random virtual addresses\n", i);
 
@@ -510,7 +583,7 @@ st_state_machine_test (
 
     return;
 }
-VOID 
+int
 main (
     int argc,
     char** argv
